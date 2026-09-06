@@ -7,6 +7,9 @@ jobs:
   fetch:
     runs-on: ubuntu-latest
     steps:
+      - name: Install PyMuPDF (to verify edition number from PDF content)
+        run: python3 -m pip install pymupdf -q
+
       - name: Download only the 5 missing editions (verified by PDF content)
         run: |
           python3 - <<'PY'
@@ -15,7 +18,7 @@ jobs:
           CTX = ssl.create_default_context()
           UA = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120.0 Safari/537.36"}
 
-          # 真实缺失的 5 期，以及它们大致的发布时间窗口
+          # 真正缺失的 5 期 + 它们大致的发布时间窗口
           MISSING = {
               "3rd_2007":  ("20070101000000", "20071231000000"),
               "7th_2011":  ("20110101000000", "20111231000000"),
@@ -47,31 +50,31 @@ jobs:
                   pass
               return None
 
-          print("[*] 查询 Wayback CDX 全部快照 ...")
+          def label_to_num(label):
+              return int(''.join(ch for ch in label.split('_')[0] if ch.isdigit()))
+
+          print("[*] query Wayback CDX ...")
           cdx = ("https://web.archive.org/cdx/search/cdx"
                  "?url=demographia.com/db-worldua.pdf"
                  "&output=json&filter=statuscode:200"
                  "&from=2005&to=2025&limit=200000")
           req = urllib.request.Request(cdx, headers=UA)
           data = json.loads(urllib.request.urlopen(req, timeout=120, context=CTX).read())
-          if len(data) < 2:
-              print("无快照"); raise SystemExit(1)
-
           hdr = data[0]
           ti = hdr.index("timestamp"); oi = hdr.index("original")
           caps = [(r[ti], r[oi]) for r in data[1:]]
 
           ok = 0
           for label, (tfrom, tto) in MISSING.items():
-              expect = int(label.split("rd_")[0].split("nd_")[0].split("th_")[0].split("st_")[0])
-              print(f"[*] 找第 {expect} 期 ({label}) ...", end=" ", flush=True)
+              expect = label_to_num(label)
+              print(f"[*] looking for edition {expect} ({label}) ...", end=" ", flush=True)
               found = False
-              # 筛选时间窗口内快照，按离窗口中点近排序
-              window_caps = [(c, o) for c, o in caps if tfrom <= c <= tto]
-              if not window_caps:
-                  window_caps = sorted(caps, key=lambda x: abs(int(x[0]) - int(tfrom))) )[:15]
-              window_caps = sorted(window_caps, key=lambda x: abs(int(x[0]) - (int(tfrom)+int(tto))//2))
-              for cap_ts, orig in window_caps:
+              mid = (int(tfrom) + int(tto)) // 2
+              window = [c for c in caps if tfrom <= c[0] <= tto]
+              if not window:
+                  window = sorted(caps, key=lambda x: abs(int(x[0]) - int(tfrom)))[:15]
+              window = sorted(window, key=lambda x: abs(int(x[0]) - mid))
+              for cap_ts, orig in window:
                   for mod in ("id_", ""):
                       try:
                           url = f"https://web.archive.org/web/{cap_ts}{mod}/{orig}"
@@ -82,17 +85,17 @@ jobs:
                           if edn == expect:
                               dest = f"editions/Demographia_{label}.pdf"
                               open(dest, "wb").write(body)
-                              print(f"OK 第{edn}期 快照{cap_ts} ({len(body):,} bytes)")
+                              print(f"OK edn{edn} snap{cap_ts} ({len(body):,} bytes)")
                               ok += 1; found = True; break
                       except Exception:
                           continue
                   if found:
                       break
               if not found:
-                  print(f"[FAIL] 未找到第 {expect} 期")
+                  print(f"[FAIL] edition {expect} not found")
               time.sleep(0.5)
 
-          print(f"\n==== 完成：成功 {ok}/{len(MISSING)} ====")
+          print(f"\n==== done: {ok}/{len(MISSING)} ====")
           for f in sorted(os.listdir("editions")):
               print("  ", f, os.path.getsize(os.path.join("editions", f)), "bytes")
           PY
