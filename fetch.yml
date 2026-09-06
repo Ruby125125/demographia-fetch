@@ -1,4 +1,4 @@
-name: Fetch Demographia World Urban Areas
+name: Fetch Missing Demographia Editions
 on:
   workflow_dispatch:
 permissions:
@@ -7,88 +7,101 @@ jobs:
   fetch:
     runs-on: ubuntu-latest
     steps:
-      - name: Download 15 historical editions (validated PDFs)
+      - name: Download only the 5 missing editions (verified by PDF content)
         run: |
           python3 - <<'PY'
-          import json, os, ssl, time, urllib.request
+          import json, os, re, ssl, time, urllib.request, fitz
 
           CTX = ssl.create_default_context()
-          UA = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"}
+          UA = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120.0 Safari/537.36"}
 
-          TARGETS = {
-              "1st_2005":  "20051201000000",
-              "2nd_2006":  "20060601000000",
-              "3rd_2007":  "20070101000000",
-              "4th_2008":  "20080101000000",
-              "5th_2009":  "20090101000000",
-              "7th_2011":  "20110401000000",
-              "9th_2013":  "20130301000000",
-              "10th_2014": "20140501000000",
-              "11th_2015": "20150101000000",
-              "13th_2017": "20170401000000",
-              "14th_2018": "20180401000000",
-              "16th_2020": "20200101000000",
-              "17th_2021": "20210101000000",
-              "18th_2022": "20220101000000",
-              "19th_2023": "20230801000000",
+          # 真实缺失的 5 期，以及它们大致的发布时间窗口
+          MISSING = {
+              "3rd_2007":  ("20070101000000", "20071231000000"),
+              "7th_2011":  ("20110101000000", "20111231000000"),
+              "11th_2015": ("20150101000000", "20151231000000"),
+              "12th_2016": ("20160101000000", "20161231000000"),
+              "19th_2023": ("20230101000000", "20231231000000"),
           }
 
           os.makedirs("editions", exist_ok=True)
-          total = len(TARGETS)
-
-          print("[*] 查询 Wayback CDX 快照列表 ...")
-          cdx = ("https://web.archive.org/cdx/search/cdx"
-                 "?url=demographia.com/db-worldua.pdf"
-                 "&output=json&filter=statuscode:200"
-                 "&from=2005&to=2026&limit=200000")
-          req = urllib.request.Request(cdx, headers=UA)
-          data = json.loads(urllib.request.urlopen(req, timeout=120, context=CTX).read())
-          if len(data) < 2:
-              print("未找到任何有效快照"); raise SystemExit(1)
-          hdr = data[0]
-          ti = hdr.index("timestamp"); oi = hdr.index("original")
-          caps = [(r[ti], r[oi]) for r in data[1:]]
-          print(f"[*] 共找到 {len(caps)} 个有效快照")
 
           def fetch(url):
               return urllib.request.urlopen(
                   urllib.request.Request(url, headers=UA), timeout=300, context=CTX).read()
 
-          def is_pdf(b):
+          def is_valid_pdf(b):
               return b[:5] == b"%PDF-" and b"%%EOF" in b[-4096:]
 
+          def detect_edition(p):
+              try:
+                  doc = fitz.open(stream=p, filetype="pdf")
+                  txt = ""
+                  for i in range(min(3, doc.page_count)):
+                      txt += doc[i].get_text()
+                  doc.close()
+                  m = re.search(r'(\d{1,2})\s*(st|nd|rd|th)\s+Annual Edition', txt, re.I)
+                  if m:
+                      return int(m.group(1))
+              except Exception:
+                  pass
+              return None
+
+          print("[*] 查询 Wayback CDX 全部快照 ...")
+          cdx = ("https://web.archive.org/cdx/search/cdx"
+                 "?url=demographia.com/db-worldua.pdf"
+                 "&output=json&filter=statuscode:200"
+                 "&from=2005&to=2025&limit=200000")
+          req = urllib.request.Request(cdx, headers=UA)
+          data = json.loads(urllib.request.urlopen(req, timeout=120, context=CTX).read())
+          if len(data) < 2:
+              print("无快照"); raise SystemExit(1)
+
+          hdr = data[0]
+          ti = hdr.index("timestamp"); oi = hdr.index("original")
+          caps = [(r[ti], r[oi]) for r in data[1:]]
+
           ok = 0
-          for name, ts in TARGETS.items():
-              cands = sorted(caps, key=lambda c: abs(int(c[0]) - int(ts)))[:10]
-              done = False
-              for cap_ts, orig in cands:
+          for label, (tfrom, tto) in MISSING.items():
+              expect = int(label.split("rd_")[0].split("nd_")[0].split("th_")[0].split("st_")[0])
+              print(f"[*] 找第 {expect} 期 ({label}) ...", end=" ", flush=True)
+              found = False
+              # 筛选时间窗口内快照，按离窗口中点近排序
+              window_caps = [(c, o) for c, o in caps if tfrom <= c <= tto]
+              if not window_caps:
+                  window_caps = sorted(caps, key=lambda x: abs(int(x[0]) - int(tfrom))) )[:15]
+              window_caps = sorted(window_caps, key=lambda x: abs(int(x[0]) - (int(tfrom)+int(tto))//2))
+              for cap_ts, orig in window_caps:
                   for mod in ("id_", ""):
                       try:
                           url = f"https://web.archive.org/web/{cap_ts}{mod}/{orig}"
                           body = fetch(url)
-                          if is_pdf(body):
-                              dest = f"editions/Demographia_World_Urban_Areas_{name}.pdf"
+                          if not is_valid_pdf(body):
+                              continue
+                          edn = detect_edition(body)
+                          if edn == expect:
+                              dest = f"editions/Demographia_{label}.pdf"
                               open(dest, "wb").write(body)
-                              print(f"[OK]   {name}  <- 快照 {cap_ts}  ({len(body):,} bytes)")
-                              ok += 1; done = True; break
+                              print(f"OK 第{edn}期 快照{cap_ts} ({len(body):,} bytes)")
+                              ok += 1; found = True; break
                       except Exception:
-                          pass
-                  if done:
+                          continue
+                  if found:
                       break
-              if not done:
-                  print(f"[FAIL] {name} 所有候选均非有效 PDF")
+              if not found:
+                  print(f"[FAIL] 未找到第 {expect} 期")
               time.sleep(0.5)
 
-          print(f"\n==== 完成：成功 {ok}/{total} ====")
+          print(f"\n==== 完成：成功 {ok}/{len(MISSING)} ====")
           for f in sorted(os.listdir("editions")):
               print("  ", f, os.path.getsize(os.path.join("editions", f)), "bytes")
           PY
 
-      - name: Upload editions as artifact
+      - name: Upload missing editions
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: demographia-pdfs
+          name: demographia-missing
           path: editions/*.pdf
           if-no-files-found: warn
           retention-days: 90
