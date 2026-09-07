@@ -1,0 +1,110 @@
+name: Fetch Missing Demographia Editions
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install PyMuPDF (to verify edition number from PDF content)
+        run: python3 -m pip install pymupdf -q
+
+      - name: Download only the 5 missing editions (verified by PDF content)
+        run: |
+          python3 - <<'PY'
+          import json, os, re, ssl, time, urllib.request, fitz
+
+          CTX = ssl.create_default_context()
+          UA = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120.0 Safari/537.36"}
+
+          # 真正缺失的 5 期 + 它们大致的发布时间窗口
+          MISSING = {
+              "3rd_2007":  ("20070101000000", "20071231000000"),
+              "7th_2011":  ("20110101000000", "20111231000000"),
+              "11th_2015": ("20150101000000", "20151231000000"),
+              "12th_2016": ("20160101000000", "20161231000000"),
+              "19th_2023": ("20230101000000", "20231231000000"),
+          }
+
+          os.makedirs("editions", exist_ok=True)
+
+          def fetch(url):
+              return urllib.request.urlopen(
+                  urllib.request.Request(url, headers=UA), timeout=300, context=CTX).read()
+
+          def is_valid_pdf(b):
+              return b[:5] == b"%PDF-" and b"%%EOF" in b[-4096:]
+
+          def detect_edition(p):
+              try:
+                  doc = fitz.open(stream=p, filetype="pdf")
+                  txt = ""
+                  for i in range(min(3, doc.page_count)):
+                      txt += doc[i].get_text()
+                  doc.close()
+                  m = re.search(r'(\d{1,2})\s*(st|nd|rd|th)\s+Annual Edition', txt, re.I)
+                  if m:
+                      return int(m.group(1))
+              except Exception:
+                  pass
+              return None
+
+          def label_to_num(label):
+              return int(''.join(ch for ch in label.split('_')[0] if ch.isdigit()))
+
+          print("[*] query Wayback CDX ...")
+          cdx = ("https://web.archive.org/cdx/search/cdx"
+                 "?url=demographia.com/db-worldua.pdf"
+                 "&output=json&filter=statuscode:200"
+                 "&from=2005&to=2025&limit=200000")
+          req = urllib.request.Request(cdx, headers=UA)
+          data = json.loads(urllib.request.urlopen(req, timeout=120, context=CTX).read())
+          hdr = data[0]
+          ti = hdr.index("timestamp"); oi = hdr.index("original")
+          caps = [(r[ti], r[oi]) for r in data[1:]]
+
+          ok = 0
+          for label, (tfrom, tto) in MISSING.items():
+              expect = label_to_num(label)
+              print(f"[*] looking for edition {expect} ({label}) ...", end=" ", flush=True)
+              found = False
+              mid = (int(tfrom) + int(tto)) // 2
+              window = [c for c in caps if tfrom <= c[0] <= tto]
+              if not window:
+                  window = sorted(caps, key=lambda x: abs(int(x[0]) - int(tfrom)))[:15]
+              window = sorted(window, key=lambda x: abs(int(x[0]) - mid))
+              for cap_ts, orig in window:
+                  for mod in ("id_", ""):
+                      try:
+                          url = f"https://web.archive.org/web/{cap_ts}{mod}/{orig}"
+                          body = fetch(url)
+                          if not is_valid_pdf(body):
+                              continue
+                          edn = detect_edition(body)
+                          if edn == expect:
+                              dest = f"editions/Demographia_{label}.pdf"
+                              open(dest, "wb").write(body)
+                              print(f"OK edn{edn} snap{cap_ts} ({len(body):,} bytes)")
+                              ok += 1; found = True; break
+                      except Exception:
+                          continue
+                  if found:
+                      break
+              if not found:
+                  print(f"[FAIL] edition {expect} not found")
+              time.sleep(0.5)
+
+          print(f"\n==== done: {ok}/{len(MISSING)} ====")
+          for f in sorted(os.listdir("editions")):
+              print("  ", f, os.path.getsize(os.path.join("editions", f)), "bytes")
+          PY
+
+      - name: Upload missing editions
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: demographia-missing
+          path: editions/*.pdf
+          if-no-files-found: warn
+          retention-days: 90
